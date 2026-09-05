@@ -41,7 +41,7 @@ STATUS_MESSAGES = {
 STARTUP_MESSAGE = {
     "title": "Tracker started",
     "description": "Current status: **{status}**{place_suffix}",
-    "color": 0x9B59B6,
+    "color": 0x9B59B6,  # purple
 }
 
 ENDED_MESSAGE = {
@@ -94,6 +94,31 @@ def get_game_name(place_id: int) -> str | None:
         return None
 
 
+def format_duration(seconds: float) -> str:
+    """Turn a number of seconds into a short human string like '1h 12m' or '45s'."""
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if not hours and not minutes:
+        parts.append(f"{secs}s")
+
+    return " ".join(parts)
+
+
+def edit_webhook_message(message_id: str, content: str):
+    """Edit a previously-sent webhook message's plain content."""
+    url = f"{WEBHOOK_URL}/messages/{message_id}"
+    resp = requests.patch(url, json={"content": content})
+    if resp.status_code >= 300:
+        print(f"Webhook edit failed: {resp.status_code} {resp.text}")
+
+
 def send_simple_embed(title: str, description: str, color: int):
     embed = {"title": title, "description": description, "color": color}
     payload = {"embeds": [embed]}
@@ -120,7 +145,7 @@ def send_ended_message():
     send_simple_embed(ENDED_MESSAGE["title"], description, ENDED_MESSAGE["color"])
 
 
-def send_webhook_update(status: str, place_name: str | None, game_start_time: float | None):
+def send_webhook_update(status: str, place_name: str | None, game_start_time: float | None) -> str | None:
     msg_config = STATUS_MESSAGES.get(status, STATUS_MESSAGES["Unknown"])
     place = place_name or "a game"
 
@@ -141,9 +166,15 @@ def send_webhook_update(status: str, place_name: str | None, game_start_time: fl
     if AVATAR_URL:
         payload["avatar_url"] = AVATAR_URL
 
-    resp = requests.post(WEBHOOK_URL, json=payload)
+    resp = requests.post(WEBHOOK_URL, params={"wait": "true"}, json=payload)
     if resp.status_code >= 300:
         print(f"Webhook post failed: {resp.status_code} {resp.text}")
+        return None
+
+    try:
+        return resp.json().get("id")
+    except (ValueError, KeyError):
+        return None
 
 
 def main():
@@ -163,6 +194,7 @@ def main():
     last_status = None
     last_place_id = None
     game_start_time = None
+    game_message_id = None
 
     try:
         presence = get_presence(user_id)
@@ -171,8 +203,6 @@ def main():
         startup_place_name = None
         if last_status == "In Game" and last_place_id:
             startup_place_name = get_game_name(last_place_id)
-            # We don't know exactly when they started, so treat "now" as the
-            # start of the session we're tracking.
             game_start_time = time.time()
         send_startup_message(last_status, startup_place_name)
     except Exception as e:
@@ -185,17 +215,24 @@ def main():
             place_id = presence.get("placeId")
 
             if status != last_status or place_id != last_place_id:
+                if last_status == "In Game" and game_message_id and game_start_time:
+                    duration = format_duration(time.time() - game_start_time)
+                    edit_webhook_message(game_message_id, f"Was in game for {duration}")
+
                 place_name = None
                 if status == "In Game" and place_id:
                     place_name = get_game_name(place_id)
 
                 if status == "In Game":
-                    # New game session (either just started, or switched games) -> reset the clock.
                     game_start_time = time.time()
                 else:
                     game_start_time = None
+                    game_message_id = None
 
-                send_webhook_update(status, place_name, game_start_time)
+                new_message_id = send_webhook_update(status, place_name, game_start_time)
+                if status == "In Game":
+                    game_message_id = new_message_id
+
                 last_status = status
                 last_place_id = place_id
         except KeyboardInterrupt:
